@@ -4,7 +4,7 @@
 # Purpose: Starts a local relay plus the public bridge for OSS and self-host workflows.
 # Layer: developer utility
 # Exports: none
-# Depends on: node, npm, curl, relay/server.js, phodex-bridge/bin/remodex.js
+# Depends on: node, npm, cargo, curl, relay/server.js, phodex-bridge/Cargo.toml
 
 set -euo pipefail
 
@@ -127,7 +127,7 @@ cleanup() {
   if [[ "${BRIDGE_SERVICE_STARTED}" == "true" ]]; then
     (
       cd "${BRIDGE_DIR}"
-      node ./bin/remodex.js stop >/dev/null 2>&1 || true
+      cargo run --quiet --bin remodex -- stop >/dev/null 2>&1 || true
     )
   fi
 
@@ -157,6 +157,7 @@ ensure_node_version() {
 ensure_prerequisites() {
   require_command node
   require_command npm
+  require_command cargo
   require_command curl
   ensure_node_version
 }
@@ -300,7 +301,7 @@ start_bridge() {
   cd "${BRIDGE_DIR}"
   # The bridge bakes REMODEX_RELAY into the pairing QR, so advertise the host
   # the iPhone can actually reach instead of the loopback health-check host.
-  REMODEX_RELAY="ws://${RELAY_HOSTNAME}:${RELAY_PORT}/relay" node ./bin/remodex.js up
+  REMODEX_RELAY="ws://${RELAY_HOSTNAME}:${RELAY_PORT}/relay" cargo run --quiet --bin remodex -- up
   BRIDGE_SERVICE_STARTED="true"
 }
 
@@ -317,7 +318,6 @@ RELAY_HOSTNAME="$(default_hostname)"
 RELAY_BRIDGE_HOST="$(healthcheck_host)"
 
 ensure_prerequisites
-ensure_package_dependencies "${BRIDGE_DIR}"
 ensure_package_dependencies "${RELAY_DIR}"
 ensure_hostname_belongs_to_this_mac
 ensure_port_available
