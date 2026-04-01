@@ -20,6 +20,7 @@ use crate::config::{read_bridge_config, BridgeConfig};
 use crate::daemon_state::write_pairing_session;
 use crate::package_version_status::BridgePackageVersionStatusReader;
 use crate::qr::print_qr;
+use crate::rollout_live_mirror::RolloutLiveMirrorController;
 use crate::secure_device_state::{
     load_or_create_bridge_device_state, resolve_bridge_relay_session,
 };
@@ -69,6 +70,33 @@ struct TrackedRequest {
     created_at: Instant,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ThreadRuntimeContext {
+    model: Option<String>,
+    model_provider: Option<String>,
+}
+
+impl ThreadRuntimeContext {
+    fn is_empty(&self) -> bool {
+        self.model.is_none() && self.model_provider.is_none()
+    }
+
+    fn merge(&mut self, incoming: &Self) {
+        if self.model.is_none() {
+            self.model = incoming.model.clone();
+        }
+        if self.model_provider.is_none() {
+            self.model_provider = incoming.model_provider.clone();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingThreadStartContext {
+    context: ThreadRuntimeContext,
+    created_at: Instant,
+}
+
 #[derive(Clone)]
 struct BridgeStatusSnapshot {
     state: String,
@@ -113,12 +141,15 @@ struct BridgeRuntime {
     pending_auth_login: Arc<Mutex<PendingAuthLogin>>,
     forwarded_initialize_request_ids: HashSet<String>,
     forwarded_request_methods_by_id: HashMap<String, TrackedRequest>,
+    pending_thread_start_contexts_by_request_id: HashMap<String, PendingThreadStartContext>,
     relay_sanitized_response_methods_by_id: HashMap<String, TrackedRequest>,
+    thread_runtime_context_by_thread_id: HashMap<String, ThreadRuntimeContext>,
     last_relay_activity_at: Option<Instant>,
     last_connection_status: Option<String>,
     last_published_status: Option<BridgeStatusSnapshot>,
     codex_handshake_warm: bool,
     context_usage_watch: Option<ContextUsageWatch>,
+    rollout_live_mirror: Option<RolloutLiveMirrorController>,
 }
 
 #[derive(Clone, Copy)]
@@ -180,12 +211,21 @@ pub async fn start_bridge(options: StartBridgeOptions) -> Result<()> {
         pending_auth_login: Arc::new(Mutex::new(PendingAuthLogin::default())),
         forwarded_initialize_request_ids: HashSet::new(),
         forwarded_request_methods_by_id: HashMap::new(),
+        pending_thread_start_contexts_by_request_id: HashMap::new(),
         relay_sanitized_response_methods_by_id: HashMap::new(),
+        thread_runtime_context_by_thread_id: HashMap::new(),
         last_relay_activity_at: None,
         last_connection_status: None,
         last_published_status: None,
         codex_handshake_warm: !config.codex_endpoint.trim().is_empty(),
         context_usage_watch: None,
+        rollout_live_mirror: if config.codex_endpoint.trim().is_empty() {
+            Some(RolloutLiveMirrorController::new(
+                crate::rollout::resolve_sessions_root(),
+            ))
+        } else {
+            None
+        },
     };
 
     runtime.run().await

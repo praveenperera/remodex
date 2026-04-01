@@ -11,6 +11,7 @@ mod package_version_status;
 mod push;
 mod qr;
 mod rollout;
+mod rollout_live_mirror;
 mod secure_device_state;
 mod secure_transport;
 mod session_state;

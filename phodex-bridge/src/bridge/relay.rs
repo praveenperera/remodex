@@ -201,6 +201,11 @@ impl BridgeRuntime {
                     if let Some(notification) = self.poll_context_usage() {
                         self.secure_transport.queue_outbound_application_message(notification);
                     }
+                    if let Some(rollout_live_mirror) = self.rollout_live_mirror.as_mut() {
+                        for notification in rollout_live_mirror.poll_notifications() {
+                            self.secure_transport.queue_outbound_application_message(notification);
+                        }
+                    }
                 }
             }
         }
@@ -233,6 +238,9 @@ impl BridgeRuntime {
     fn handle_transport_reset(&mut self) {
         self.last_relay_activity_at = None;
         self.context_usage_watch = None;
+        if let Some(rollout_live_mirror) = self.rollout_live_mirror.as_mut() {
+            rollout_live_mirror.stop_all();
+        }
     }
 
     fn log_connection_status(&mut self, status: &str) -> Result<()> {

@@ -14,7 +14,8 @@ pub fn resolve_sessions_root() -> PathBuf {
 }
 
 pub fn read_latest_context_window_usage(thread_id: &str, turn_id: Option<&str>) -> Option<Value> {
-    let rollout_path = find_recent_rollout_file_for_context_read(thread_id, turn_id)?;
+    let rollout_path =
+        find_recent_rollout_file_for_context_read(&resolve_sessions_root(), thread_id, turn_id)?;
     let raw = fs::read_to_string(rollout_path).ok()?;
     let mut usage = None;
     for line in raw.lines() {
@@ -28,7 +29,11 @@ pub fn thread_context_read(thread_id: &str, turn_id: Option<&str>) -> Value {
     json!({
         "threadId": thread_id,
         "usage": usage,
-        "rolloutPath": find_recent_rollout_file_for_context_read(thread_id, turn_id)
+        "rolloutPath": find_recent_rollout_file_for_context_read(
+            &resolve_sessions_root(),
+            thread_id,
+            turn_id
+        )
             .map(|path| path.display().to_string()),
     })
 }
@@ -81,11 +86,11 @@ pub fn find_rollout_file_for_thread(root: PathBuf, thread_id: &str) -> Option<Pa
         })
 }
 
-fn find_recent_rollout_file_for_context_read(
+pub(crate) fn find_recent_rollout_file_for_context_read(
+    root: &Path,
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> Option<PathBuf> {
-    let root = resolve_sessions_root();
     let mut candidates: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -108,6 +113,22 @@ fn find_recent_rollout_file_for_context_read(
             .map(|name| name.contains(thread_id))
             .unwrap_or(false)
     })
+}
+
+pub(crate) fn read_thread_rollout_session_meta(root: &Path, thread_id: &str) -> Option<Value> {
+    let rollout_path = find_recent_rollout_file_for_context_read(root, thread_id, None)?;
+    let raw = fs::read_to_string(rollout_path).ok()?;
+
+    for line in raw.lines() {
+        let Ok(parsed) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if parsed.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return parsed.get("payload").cloned();
+        }
+    }
+
+    None
 }
 
 fn rollout_matches_thread(path: &Path, thread_id: &str, turn_id: Option<&str>) -> bool {
@@ -144,4 +165,40 @@ fn extract_context_usage_from_rollout_line(raw_line: &str) -> Option<Value> {
         "tokensUsed": tokens_used,
         "tokenLimit": token_limit,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::read_thread_rollout_session_meta;
+
+    #[test]
+    fn read_thread_rollout_session_meta_returns_session_payload() {
+        let temp = tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let thread_dir = sessions_root.join("2026").join("04").join("01");
+        fs::create_dir_all(&thread_dir).unwrap();
+        let rollout_path = thread_dir.join("rollout-2026-04-01T12-00-27-thread-1.jsonl");
+        fs::write(
+            &rollout_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "thread-1",
+                        "model_provider": "openai",
+                    },
+                })
+            ),
+        )
+        .unwrap();
+
+        let payload = read_thread_rollout_session_meta(&sessions_root, "thread-1").unwrap();
+        assert_eq!(payload["model_provider"], json!("openai"));
+    }
 }
