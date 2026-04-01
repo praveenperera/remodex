@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::secure_device_state::BridgeDeviceState;
 
-use super::{RelayCommand, ThreadRuntimeContext};
+use super::RelayCommand;
 
 pub(super) fn send_relay_registration_update(
     command_tx: &tokio::sync::mpsc::UnboundedSender<RelayCommand>,
@@ -243,105 +243,6 @@ pub(super) fn stringify_request_id(value: &Value) -> Option<String> {
     }
 }
 
-pub(super) fn thread_runtime_context_from_value(value: &Value) -> ThreadRuntimeContext {
-    let metadata = value.get("metadata");
-    ThreadRuntimeContext {
-        model: read_string(value.get("model"))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("model"))))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("modelName"))))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("model_name")))),
-        model_provider: read_string(value.get("modelProvider"))
-            .or_else(|| read_string(value.get("model_provider")))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("modelProvider"))))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("model_provider"))))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("modelProviderId"))))
-            .or_else(|| read_string(metadata.and_then(|value| value.get("model_provider_id")))),
-    }
-}
-
-pub(super) fn rewrite_existing_thread_runtime_request(
-    parsed: &mut Value,
-    context: Option<&ThreadRuntimeContext>,
-) -> bool {
-    let method = read_string(parsed.get("method")).unwrap_or_default();
-    if method != "thread/resume" && method != "turn/start" {
-        return false;
-    }
-
-    let Some(params) = parsed.get_mut("params").and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let has_thread_id = read_string_value(params.get("threadId"))
-        .or_else(|| read_string_value(params.get("thread_id")))
-        .is_some();
-    if !has_thread_id {
-        return false;
-    }
-
-    match context {
-        Some(context) => {
-            rewrite_runtime_identity_field(params, "model", context.model.as_ref());
-            rewrite_runtime_identity_field(
-                params,
-                "modelProvider",
-                context.model_provider.as_ref(),
-            );
-            rewrite_runtime_identity_field(
-                params,
-                "model_provider",
-                context.model_provider.as_ref(),
-            );
-            if method == "turn/start" {
-                if let Some(settings) = params
-                    .get_mut("collaborationMode")
-                    .and_then(Value::as_object_mut)
-                    .and_then(|value| value.get_mut("settings"))
-                    .and_then(Value::as_object_mut)
-                {
-                    rewrite_runtime_identity_field(settings, "model", context.model.as_ref());
-                }
-            }
-        }
-        None => {
-            params.remove("model");
-            params.remove("modelProvider");
-            params.remove("model_provider");
-            if method == "turn/start" {
-                if let Some(settings) = params
-                    .get_mut("collaborationMode")
-                    .and_then(Value::as_object_mut)
-                    .and_then(|value| value.get_mut("settings"))
-                    .and_then(Value::as_object_mut)
-                {
-                    settings.remove("model");
-                }
-            }
-        }
-    }
-
-    true
-}
-
-fn rewrite_runtime_identity_field(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: Option<&String>,
-) {
-    if let Some(value) = value {
-        object.insert(key.to_owned(), Value::String(value.clone()));
-    } else {
-        object.remove(key);
-    }
-}
-
-fn read_string_value(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 pub(super) fn error_code_for_method(method: &str) -> &str {
     match method {
         "account/status/read" | "getAuthStatus" | "account/login/openOnMac" => "auth_status_failed",
@@ -379,11 +280,7 @@ pub(super) async fn shutdown_signal() {
 mod tests {
     use serde_json::json;
 
-    use super::{
-        relay_ws_url, rewrite_existing_thread_runtime_request,
-        sanitize_thread_history_images_for_relay, thread_runtime_context_from_value,
-    };
-    use crate::bridge::ThreadRuntimeContext;
+    use super::{relay_ws_url, sanitize_thread_history_images_for_relay};
 
     #[test]
     fn relay_ws_url_converts_http_scheme_and_appends_session() {
@@ -458,91 +355,5 @@ mod tests {
             sanitize_thread_history_images_for_relay(raw_message.clone(), "turn/start"),
             raw_message
         );
-    }
-
-    #[test]
-    fn rewrite_existing_thread_runtime_request_uses_cached_model_and_provider() {
-        let mut raw_message = json!({
-            "id": "req-resume",
-            "method": "thread/resume",
-            "params": {
-                "threadId": "thread-1",
-                "model": "gpt-5.4",
-            },
-        });
-
-        let context = ThreadRuntimeContext {
-            model: Some("gpt-5.4-mini".to_owned()),
-            model_provider: Some("openai".to_owned()),
-        };
-        assert!(rewrite_existing_thread_runtime_request(
-            &mut raw_message,
-            Some(&context)
-        ));
-        assert_eq!(raw_message["params"]["model"], json!("gpt-5.4-mini"));
-        assert_eq!(raw_message["params"]["modelProvider"], json!("openai"));
-    }
-
-    #[test]
-    fn rewrite_existing_thread_runtime_request_strips_unknown_existing_thread_model() {
-        let mut raw_message = json!({
-            "id": "req-turn",
-            "method": "turn/start",
-            "params": {
-                "threadId": "thread-1",
-                "model": "gpt-5.4",
-                "collaborationMode": {
-                    "settings": {
-                        "model": "gpt-5.4"
-                    }
-                }
-            },
-        });
-
-        assert!(rewrite_existing_thread_runtime_request(
-            &mut raw_message,
-            None
-        ));
-        assert!(raw_message["params"].get("model").is_none());
-        assert!(raw_message["params"]["collaborationMode"]["settings"]
-            .get("model")
-            .is_none());
-    }
-
-    #[test]
-    fn thread_runtime_context_from_value_reads_metadata_fallbacks() {
-        let context = thread_runtime_context_from_value(&json!({
-            "id": "thread-1",
-            "metadata": {
-                "model_name": "gpt-5.4-mini",
-                "model_provider": "openai",
-            }
-        }));
-
-        assert_eq!(
-            context,
-            ThreadRuntimeContext {
-                model: Some("gpt-5.4-mini".to_owned()),
-                model_provider: Some("openai".to_owned()),
-            }
-        );
-    }
-
-    #[test]
-    fn rewrite_existing_thread_runtime_request_leaves_thread_start_untouched() {
-        let mut raw_message = json!({
-            "id": "req-start",
-            "method": "thread/start",
-            "params": {
-                "model": "gpt-5.4",
-            },
-        });
-
-        let original = raw_message.clone();
-        assert!(!rewrite_existing_thread_runtime_request(
-            &mut raw_message,
-            None
-        ));
-        assert_eq!(raw_message, original);
     }
 }

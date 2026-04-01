@@ -5,14 +5,9 @@ use serde_json::{json, Value};
 use crate::session_state::remember_active_thread;
 
 use super::support::{
-    extract_bridge_message_context, rewrite_existing_thread_runtime_request,
-    sanitize_thread_history_images_for_relay, stringify_request_id,
-    thread_runtime_context_from_value,
+    extract_bridge_message_context, sanitize_thread_history_images_for_relay, stringify_request_id,
 };
-use super::{
-    BridgeRuntime, BridgeTask, PendingAuthLogin, PendingThreadStartContext, ThreadRuntimeContext,
-    TrackedRequest,
-};
+use super::{BridgeRuntime, BridgeTask, PendingAuthLogin, TrackedRequest};
 
 impl BridgeRuntime {
     pub(super) fn handle_application_message(&mut self, raw_message: String) {
@@ -56,9 +51,12 @@ impl BridgeRuntime {
             }
             _ => {
                 self.prune_tracked_requests();
-                self.remember_pending_thread_start_context(&parsed);
-                let outbound_message =
-                    self.prepare_outbound_application_message(parsed, raw_message);
+                self.thread_runtime_registry.prune_stale();
+                self.thread_runtime_registry
+                    .remember_pending_thread_start_context(&parsed);
+                let outbound_message = self
+                    .thread_runtime_registry
+                    .prepare_outbound_application_message(parsed, raw_message);
                 if let Some(rollout_live_mirror) = self.rollout_live_mirror.as_mut() {
                     rollout_live_mirror.observe_inbound(&outbound_message);
                 }
@@ -78,7 +76,8 @@ impl BridgeRuntime {
 
         self.update_pending_auth_login_from_codex_message(&raw_message);
         self.track_codex_handshake_state(&raw_message);
-        self.update_thread_runtime_context_from_codex_message(&raw_message);
+        self.thread_runtime_registry
+            .update_from_codex_message(&raw_message);
         self.remember_thread_from_message("codex", &raw_message);
         let sanitized = self.sanitize_relay_bound_codex_message(raw_message);
         self.secure_transport
@@ -256,11 +255,6 @@ impl BridgeRuntime {
             tracked.created_at.elapsed()
                 < Duration::from_millis(super::FORWARDED_REQUEST_METHOD_TTL_MS)
         });
-        self.pending_thread_start_contexts_by_request_id
-            .retain(|_, tracked| {
-                tracked.created_at.elapsed()
-                    < Duration::from_millis(super::FORWARDED_REQUEST_METHOD_TTL_MS)
-            });
         self.relay_sanitized_response_methods_by_id
             .retain(|_, tracked| {
                 tracked.created_at.elapsed()
@@ -347,127 +341,5 @@ impl BridgeRuntime {
             })
             .to_string(),
         )
-    }
-
-    fn prepare_outbound_application_message(
-        &mut self,
-        mut parsed: Value,
-        raw_message: String,
-    ) -> String {
-        let thread_id = parsed
-            .get("params")
-            .and_then(Value::as_object)
-            .and_then(|params| {
-                super::support::read_string(params.get("threadId"))
-                    .or_else(|| super::support::read_string(params.get("thread_id")))
-            });
-        let Some(thread_id) = thread_id else {
-            return raw_message;
-        };
-
-        let context = self.resolve_existing_thread_runtime_context(&thread_id);
-        if rewrite_existing_thread_runtime_request(&mut parsed, context.as_ref()) {
-            parsed.to_string()
-        } else {
-            raw_message
-        }
-    }
-
-    fn remember_pending_thread_start_context(&mut self, parsed: &Value) {
-        let method = super::support::read_string(parsed.get("method")).unwrap_or_default();
-        if method != "thread/start" {
-            return;
-        }
-
-        let Some(request_id) = parsed.get("id").and_then(stringify_request_id) else {
-            return;
-        };
-        let context = parsed
-            .get("params")
-            .map(thread_runtime_context_from_value)
-            .unwrap_or_default();
-        if context.is_empty() {
-            return;
-        }
-
-        self.pending_thread_start_contexts_by_request_id.insert(
-            request_id,
-            PendingThreadStartContext {
-                context,
-                created_at: Instant::now(),
-            },
-        );
-    }
-
-    fn update_thread_runtime_context_from_codex_message(&mut self, raw_message: &str) {
-        let Ok(parsed) = serde_json::from_str::<Value>(raw_message) else {
-            return;
-        };
-
-        if let Some(thread_value) = parsed.get("result").and_then(|value| value.get("thread")) {
-            self.merge_thread_runtime_context_from_thread_value(thread_value);
-        }
-        if let Some(thread_value) = parsed.get("params").and_then(|value| value.get("thread")) {
-            self.merge_thread_runtime_context_from_thread_value(thread_value);
-        }
-
-        if let Some(response_id) = parsed.get("id").and_then(stringify_request_id) {
-            let pending_thread_start = self
-                .pending_thread_start_contexts_by_request_id
-                .remove(&response_id);
-            let thread_value = parsed.get("result").and_then(|value| value.get("thread"));
-            if let (Some(pending_thread_start), Some(thread_value)) =
-                (pending_thread_start, thread_value)
-            {
-                if let Some(thread_id) = super::support::read_string(thread_value.get("id")) {
-                    self.merge_thread_runtime_context(&thread_id, pending_thread_start.context);
-                }
-            }
-        }
-    }
-
-    fn merge_thread_runtime_context_from_thread_value(&mut self, thread_value: &Value) {
-        let Some(thread_id) = super::support::read_string(thread_value.get("id")) else {
-            return;
-        };
-
-        let context = thread_runtime_context_from_value(thread_value);
-        self.merge_thread_runtime_context(&thread_id, context);
-    }
-
-    fn merge_thread_runtime_context(&mut self, thread_id: &str, incoming: ThreadRuntimeContext) {
-        if incoming.is_empty() {
-            return;
-        }
-
-        self.thread_runtime_context_by_thread_id
-            .entry(thread_id.to_owned())
-            .and_modify(|existing| existing.merge(&incoming))
-            .or_insert(incoming);
-    }
-
-    fn resolve_existing_thread_runtime_context(
-        &mut self,
-        thread_id: &str,
-    ) -> Option<ThreadRuntimeContext> {
-        let mut resolved = self
-            .thread_runtime_context_by_thread_id
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(session_meta) = crate::rollout::read_thread_rollout_session_meta(
-            &crate::rollout::resolve_sessions_root(),
-            thread_id,
-        ) {
-            resolved.merge(&thread_runtime_context_from_value(&session_meta));
-        }
-
-        if resolved.is_empty() {
-            return None;
-        }
-
-        self.thread_runtime_context_by_thread_id
-            .insert(thread_id.to_owned(), resolved.clone());
-        Some(resolved)
     }
 }
