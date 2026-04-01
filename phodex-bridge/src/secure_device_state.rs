@@ -7,7 +7,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use color_eyre::eyre::{eyre, Result};
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -85,7 +84,9 @@ pub fn get_trusted_phone_public_key(
 }
 
 fn create_bridge_device_state() -> BridgeDeviceState {
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut private_key = [0_u8; 32];
+    let _ = getrandom::fill(&mut private_key);
+    let signing_key = SigningKey::from_bytes(&private_key);
     BridgeDeviceState {
         version: 1,
         mac_device_id: Uuid::new_v4().to_string(),

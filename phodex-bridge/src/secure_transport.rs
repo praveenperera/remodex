@@ -4,7 +4,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
@@ -304,7 +303,7 @@ impl BridgeSecureTransport {
 
         let (ephemeral_private, ephemeral_public) = generate_ephemeral_keypair();
         let mut server_nonce = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut server_nonce);
+        let _ = getrandom::fill(&mut server_nonce);
         let key_epoch = self.next_key_epoch;
         let expires_at_for_transcript = if handshake_mode == HANDSHAKE_MODE_QR_BOOTSTRAP {
             self.current_pairing_expires_at
@@ -736,7 +735,7 @@ fn diffie_hellman(private_key_base64: &str, public_key_base64: &str) -> Option<V
 
 fn generate_ephemeral_keypair() -> (StaticSecret, X25519PublicKey) {
     let mut private_bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut private_bytes);
+    let _ = getrandom::fill(&mut private_bytes);
     let private = StaticSecret::from(private_bytes);
     let public = X25519PublicKey::from(&private);
     (private, public)

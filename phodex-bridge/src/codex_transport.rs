@@ -210,7 +210,7 @@ impl CodexTransport {
                         let Some(message) = maybe_message else {
                             break;
                         };
-                        if write.send(Message::Text(message)).await.is_err() {
+                        if write.send(Message::Text(message.into())).await.is_err() {
                             let _ = event_tx.send(CodexEvent::Closed);
                             break;
                         }

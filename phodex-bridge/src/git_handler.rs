@@ -8,6 +8,158 @@ use uuid::Uuid;
 
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ChangeTransfer {
+    Move,
+    Copy,
+}
+
+impl ChangeTransfer {
+    fn from_params(params: &Value) -> Self {
+        if params.get("changeTransfer").and_then(Value::as_str) == Some("copy") {
+            Self::Copy
+        } else {
+            Self::Move
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Copy => "copy",
+        }
+    }
+
+    fn copies_changes(self) -> bool {
+        matches!(self, Self::Copy)
+    }
+}
+
+struct WorktreeCreationPlan {
+    branch: String,
+    base_branch: String,
+    repo_root: PathBuf,
+    project_relative_path: String,
+    branch_result: Value,
+    can_carry_local_changes: bool,
+    change_transfer: ChangeTransfer,
+}
+
+impl WorktreeCreationPlan {
+    fn resolve(cwd: &Path, params: &Value) -> Result<Self> {
+        let branch = normalize_created_branch_name(
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if branch.is_empty() {
+            return Err(eyre!("Branch name is required."));
+        }
+        assert_valid_created_branch_name(cwd, &branch)?;
+
+        let branch_result = git_branches(cwd)?;
+        let repo_root = resolve_repo_root(cwd)?;
+        let status = git_status(cwd)?;
+        let project_relative_path = resolve_project_relative_path(cwd, &repo_root);
+        let default_branch = branch_result
+            .get("default")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let base_branch = params
+            .get("baseBranch")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_branch)
+            .to_owned();
+        if base_branch.is_empty() {
+            return Err(eyre!("Base branch is required."));
+        }
+        if !local_branch_exists(cwd, &base_branch) {
+            return Err(eyre!(
+                "Base branch '{base_branch}' is not available locally. Create or check out that branch first."
+            ));
+        }
+
+        let current_branch = status.get("branch").and_then(Value::as_str).unwrap_or("");
+        let dirty = status
+            .get("dirty")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let change_transfer = ChangeTransfer::from_params(params);
+        let can_carry_local_changes =
+            dirty && !current_branch.is_empty() && current_branch == base_branch;
+        if dirty && !can_carry_local_changes {
+            let current_branch_label = if current_branch.is_empty() {
+                "the current branch"
+            } else {
+                current_branch
+            };
+            return Err(eyre!(
+                "Uncommitted changes can {} into a new worktree only from {}. Switch the base branch to match or clean up local changes first.",
+                change_transfer.verb(),
+                current_branch_label
+            ));
+        }
+
+        Ok(Self {
+            branch,
+            base_branch,
+            repo_root,
+            project_relative_path,
+            branch_result,
+            can_carry_local_changes,
+            change_transfer,
+        })
+    }
+
+    fn existing_worktree_response(&self, cwd: &Path) -> Option<Result<Value>> {
+        let existing_worktree_path = self
+            .branch_result
+            .get("worktreePathByBranch")
+            .and_then(|value| value.get(&self.branch))
+            .and_then(Value::as_str)?;
+
+        if same_file_path(Path::new(existing_worktree_path), cwd) {
+            return Some(Err(eyre!(
+                "Branch '{}' is already open in this project.",
+                self.branch
+            )));
+        }
+
+        Some(Ok(json!({
+            "branch": self.branch,
+            "worktreePath": existing_worktree_path,
+            "alreadyExisted": true,
+        })))
+    }
+
+    fn copied_local_changes_patch(&self) -> Result<String> {
+        if self.can_carry_local_changes && self.change_transfer.copies_changes() {
+            capture_local_changes_patch(&self.repo_root)
+        } else {
+            Ok(String::new())
+        }
+    }
+
+    fn apply_local_changes(
+        &self,
+        worktree_root_path: &Path,
+        copied_local_changes_patch: &str,
+    ) -> Result<()> {
+        if self.can_carry_local_changes && !self.change_transfer.copies_changes() {
+            move_local_changes_to_worktree(&self.repo_root, worktree_root_path)?;
+        }
+
+        if !copied_local_changes_patch.trim().is_empty() {
+            apply_copied_local_changes_to_worktree(worktree_root_path, copied_local_changes_patch)?;
+        }
+
+        Ok(())
+    }
+}
+
 pub async fn handle_git_request(method: &str, params: &Value) -> Result<Option<Value>> {
     if !method.starts_with("git/") {
         return Ok(None);
@@ -301,147 +453,26 @@ fn git_create_branch(cwd: &Path, params: &Value) -> Result<Value> {
 }
 
 fn git_create_worktree(cwd: &Path, params: &Value) -> Result<Value> {
-    let branch = normalize_created_branch_name(
-        params
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    );
-    if branch.is_empty() {
-        return Err(eyre!("Branch name is required."));
+    let plan = WorktreeCreationPlan::resolve(cwd, params)?;
+    if let Some(existing_worktree) = plan.existing_worktree_response(cwd) {
+        return existing_worktree;
     }
-    assert_valid_created_branch_name(cwd, &branch)?;
 
-    let branch_result = git_branches(cwd)?;
-    let repo_root = resolve_repo_root(cwd)?;
-    let status = git_status(cwd)?;
-    let project_relative_path = resolve_project_relative_path(cwd, &repo_root);
-    let default_branch = branch_result
-        .get("default")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let base_branch = params
-        .get("baseBranch")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(default_branch);
-    if base_branch.is_empty() {
-        return Err(eyre!("Base branch is required."));
-    }
-    if !local_branch_exists(cwd, base_branch) {
+    if local_branch_exists(cwd, &plan.branch) {
         return Err(eyre!(
-            "Base branch '{base_branch}' is not available locally. Create or check out that branch first."
+            "Branch '{}' already exists locally. Choose another name or open that branch instead.",
+            plan.branch
         ));
     }
 
-    let current_branch = status
-        .get("branch")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let dirty = status
-        .get("dirty")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let change_transfer = if params.get("changeTransfer").and_then(Value::as_str) == Some("copy") {
-        "copy"
-    } else {
-        "move"
-    };
-    let can_carry_local_changes =
-        dirty && !current_branch.is_empty() && current_branch == base_branch;
-    if dirty && !can_carry_local_changes {
-        return Err(eyre!(
-            "Uncommitted changes can {} into a new worktree only from {}. Switch the base branch to match or clean up local changes first.",
-            if change_transfer == "copy" { "copy" } else { "move" },
-            if current_branch.is_empty() { "the current branch" } else { &current_branch }
-        ));
-    }
-
-    if let Some(existing_worktree_path) = branch_result
-        .get("worktreePathByBranch")
-        .and_then(|value| value.get(&branch))
-        .and_then(Value::as_str)
-    {
-        if same_file_path(Path::new(existing_worktree_path), cwd) {
-            return Err(eyre!("Branch '{branch}' is already open in this project."));
-        }
-        return Ok(json!({
-            "branch": branch,
-            "worktreePath": existing_worktree_path,
-            "alreadyExisted": true,
-        }));
-    }
-
-    if local_branch_exists(cwd, &branch) {
-        return Err(eyre!(
-            "Branch '{branch}' already exists locally. Choose another name or open that branch instead."
-        ));
-    }
-
-    let worktree_root_path = allocate_managed_worktree_path(&repo_root)?;
-    let mut copied_local_changes_patch = String::new();
-    if can_carry_local_changes && change_transfer == "copy" {
-        copied_local_changes_patch = capture_local_changes_patch(&repo_root)?;
-    }
-
-    if let Err(error) = git(
-        &repo_root,
-        [
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            worktree_root_path.to_str().unwrap_or_default(),
-            base_branch,
-        ],
-    ) {
-        let _ = fs::remove_dir_all(worktree_root_path.parent().unwrap_or(&worktree_root_path));
-        let message = error.to_string();
-        if message.contains("invalid reference") {
-            return Err(eyre!("Base branch '{base_branch}' does not exist."));
-        }
-        if message.contains("already exists") {
-            return Err(eyre!("Branch '{branch}' already exists."));
-        }
-        if message.contains("already used by worktree")
-            || message.contains("already checked out at")
-        {
-            return Err(eyre!(
-                "Branch '{branch}' is already open in another worktree."
-            ));
-        }
-        return Err(eyre!("{message}"));
-    }
-
-    if can_carry_local_changes && change_transfer == "move" {
-        let stash_label = format!("remodex-worktree-handoff-{}", Uuid::new_v4().simple());
-        let stash_output = git(
-            &repo_root,
-            [
-                "stash",
-                "push",
-                "--include-untracked",
-                "--message",
-                &stash_label,
-            ],
-        )?;
-        if !stash_output.contains("No local changes") {
-            let stash_ref = find_stash_ref_by_label(&repo_root, &stash_label)?;
-            if let Some(stash_ref) = stash_ref {
-                let _ = git(&worktree_root_path, ["stash", "pop", &stash_ref]);
-            }
-        }
-    }
-
-    if !copied_local_changes_patch.trim().is_empty() {
-        apply_copied_local_changes_to_worktree(&worktree_root_path, &copied_local_changes_patch)?;
-    }
+    let worktree_root_path = allocate_managed_worktree_path(&plan.repo_root)?;
+    let copied_local_changes_patch = plan.copied_local_changes_patch()?;
+    create_managed_worktree(&plan, &worktree_root_path)?;
+    plan.apply_local_changes(&worktree_root_path, &copied_local_changes_patch)?;
 
     Ok(json!({
-        "branch": branch,
-        "worktreePath": scoped_worktree_path(&worktree_root_path, &project_relative_path)
+        "branch": plan.branch,
+        "worktreePath": scoped_worktree_path(&worktree_root_path, &plan.project_relative_path)
             .display()
             .to_string(),
         "alreadyExisted": false,
@@ -477,6 +508,40 @@ fn git_remove_worktree(cwd: &Path, params: &Value) -> Result<Value> {
     }
 
     Ok(json!({ "success": true }))
+}
+
+fn create_managed_worktree(plan: &WorktreeCreationPlan, worktree_root_path: &Path) -> Result<()> {
+    if let Err(error) = git(
+        &plan.repo_root,
+        [
+            "worktree",
+            "add",
+            "-b",
+            &plan.branch,
+            worktree_root_path.to_str().unwrap_or_default(),
+            &plan.base_branch,
+        ],
+    ) {
+        let _ = fs::remove_dir_all(worktree_root_path.parent().unwrap_or(worktree_root_path));
+        let message = error.to_string();
+        if message.contains("invalid reference") {
+            return Err(eyre!("Base branch '{}' does not exist.", plan.base_branch));
+        }
+        if message.contains("already exists") {
+            return Err(eyre!("Branch '{}' already exists.", plan.branch));
+        }
+        if message.contains("already used by worktree")
+            || message.contains("already checked out at")
+        {
+            return Err(eyre!(
+                "Branch '{}' is already open in another worktree.",
+                plan.branch
+            ));
+        }
+        return Err(eyre!("{message}"));
+    }
+
+    Ok(())
 }
 
 fn git_reset_to_remote(cwd: &Path, params: &Value) -> Result<Value> {
@@ -614,6 +679,29 @@ fn apply_copied_local_changes_to_worktree(cwd: &Path, patch: &str) -> Result<()>
     );
     let _ = fs::remove_file(&patch_path);
     result.map(|_| ())
+}
+
+fn move_local_changes_to_worktree(repo_root: &Path, worktree_root_path: &Path) -> Result<()> {
+    let stash_label = format!("remodex-worktree-handoff-{}", Uuid::new_v4().simple());
+    let stash_output = git(
+        repo_root,
+        [
+            "stash",
+            "push",
+            "--include-untracked",
+            "--message",
+            &stash_label,
+        ],
+    )?;
+    if stash_output.contains("No local changes") {
+        return Ok(());
+    }
+
+    if let Some(stash_ref) = find_stash_ref_by_label(repo_root, &stash_label)? {
+        let _ = git(worktree_root_path, ["stash", "pop", &stash_ref]);
+    }
+
+    Ok(())
 }
 
 fn find_stash_ref_by_label(cwd: &Path, stash_label: &str) -> Result<Option<String>> {
