@@ -15,6 +15,16 @@ const LOGS_DIR: &str = "logs";
 const BRIDGE_STDOUT_LOG_FILE: &str = "bridge.stdout.log";
 const BRIDGE_STDERR_LOG_FILE: &str = "bridge.stderr.log";
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BridgeRuntimeMetadata {
+    #[serde(rename = "runtimeKind", default)]
+    pub runtime_kind: String,
+    #[serde(rename = "runtimeSource", default)]
+    pub runtime_source: String,
+    #[serde(rename = "runtimeExecutable", default)]
+    pub runtime_executable: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairingSession {
     #[serde(rename = "createdAt")]
@@ -33,6 +43,8 @@ pub struct BridgeStatus {
     pub last_error: String,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
+    #[serde(flatten, default)]
+    pub runtime: BridgeRuntimeMetadata,
 }
 
 pub fn resolve_remodex_state_dir() -> PathBuf {
@@ -102,6 +114,7 @@ pub fn write_bridge_status(
             pid,
             last_error: last_error.to_owned(),
             updated_at: now_iso(),
+            runtime: current_bridge_runtime_metadata(),
         },
     )
 }
@@ -151,4 +164,17 @@ fn now_iso() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::new())
+}
+
+pub fn current_bridge_runtime_metadata() -> BridgeRuntimeMetadata {
+    BridgeRuntimeMetadata {
+        runtime_kind: "rust".to_owned(),
+        runtime_source: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .display()
+            .to_string(),
+        runtime_executable: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    }
 }

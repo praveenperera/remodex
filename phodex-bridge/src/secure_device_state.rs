@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -12,8 +13,11 @@ use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "com.remodex.bridge.device-state";
 const KEYCHAIN_ACCOUNT: &str = "default";
+static WARNED_KEYCHAIN_UNREADABLE: AtomicBool = AtomicBool::new(false);
+static WARNED_KEYCHAIN_MISMATCH: AtomicBool = AtomicBool::new(false);
+static WARNED_KEYCHAIN_RECOVERY: AtomicBool = AtomicBool::new(false);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeDeviceState {
     pub version: u32,
     #[serde(rename = "macDeviceId")]
@@ -33,14 +37,43 @@ pub struct RelaySession {
 }
 
 pub fn load_or_create_bridge_device_state() -> Result<BridgeDeviceState> {
-    if let Some(state) = read_canonical_file_state() {
-        let _ = write_keychain_state_string(&serde_json::to_string_pretty(&state)?);
-        return Ok(state);
+    let file_record = read_canonical_file_state_record();
+    let keychain_record = read_keychain_state_record();
+
+    match &file_record {
+        StateRecord::State(state) => {
+            reconcile_keychain_mirror(state, &keychain_record)?;
+            return Ok(state.clone());
+        }
+        StateRecord::Corrupted(error) => {
+            if let StateRecord::State(state) = &keychain_record {
+                warn_once(
+                    &WARNED_KEYCHAIN_RECOVERY,
+                    "[remodex] Recovering the canonical device-state.json from the legacy Keychain pairing mirror.",
+                );
+                write_bridge_device_state(state)?;
+                return Ok(state.clone());
+            }
+
+            return Err(eyre!(
+                "The canonical bridge pairing state at {} is unreadable: {error}",
+                resolve_store_file().display()
+            ));
+        }
+        StateRecord::Missing => {}
     }
 
-    if let Some(state) = read_keychain_state() {
-        write_bridge_device_state(&state)?;
-        return Ok(state);
+    match keychain_record {
+        StateRecord::State(state) => {
+            write_bridge_device_state(&state)?;
+            return Ok(state);
+        }
+        StateRecord::Corrupted(error) => {
+            return Err(eyre!(
+                "The legacy Keychain bridge pairing state is unreadable and no canonical device-state.json is available: {error}"
+            ));
+        }
+        StateRecord::Missing => {}
     }
 
     let state = create_bridge_device_state();
@@ -97,7 +130,8 @@ fn create_bridge_device_state() -> BridgeDeviceState {
 }
 
 fn write_bridge_device_state(state: &BridgeDeviceState) -> Result<()> {
-    let serialized = serde_json::to_string_pretty(state)?;
+    let normalized = normalize_bridge_device_state(state.clone())?;
+    let serialized = serde_json::to_string_pretty(&normalized)?;
     fs::create_dir_all(resolve_store_dir())?;
     fs::write(resolve_store_file(), &serialized)?;
     #[cfg(unix)]
@@ -109,14 +143,17 @@ fn write_bridge_device_state(state: &BridgeDeviceState) -> Result<()> {
     Ok(())
 }
 
-fn read_canonical_file_state() -> Option<BridgeDeviceState> {
-    let raw = fs::read_to_string(resolve_store_file()).ok()?;
-    serde_json::from_str(&raw).ok()
+fn read_canonical_file_state_record() -> StateRecord {
+    let path = resolve_store_file();
+    read_state_record(&path)
 }
 
-fn read_keychain_state() -> Option<BridgeDeviceState> {
-    let raw = read_keychain_state_string()?;
-    serde_json::from_str(&raw).ok()
+fn read_keychain_state_record() -> StateRecord {
+    let Some(raw) = read_keychain_state_string() else {
+        return StateRecord::Missing;
+    };
+
+    parse_bridge_device_state(&raw).into()
 }
 
 fn resolve_store_dir() -> PathBuf {
@@ -216,4 +253,294 @@ fn delete_keychain_state_string() -> Result<()> {
         ])
         .status()?;
     Ok(())
+}
+
+#[derive(Debug)]
+enum StateRecord {
+    Missing,
+    State(BridgeDeviceState),
+    Corrupted(String),
+}
+
+impl From<Result<BridgeDeviceState>> for StateRecord {
+    fn from(value: Result<BridgeDeviceState>) -> Self {
+        match value {
+            Ok(state) => Self::State(state),
+            Err(error) => Self::Corrupted(error.to_string()),
+        }
+    }
+}
+
+fn read_state_record(path: &Path) -> StateRecord {
+    if !path.exists() {
+        return StateRecord::Missing;
+    }
+
+    match fs::read_to_string(path) {
+        Ok(raw) => parse_bridge_device_state(&raw).into(),
+        Err(error) => StateRecord::Corrupted(error.to_string()),
+    }
+}
+
+fn parse_bridge_device_state(raw: &str) -> Result<BridgeDeviceState> {
+    let parsed = serde_json::from_str::<BridgeDeviceState>(raw)?;
+    normalize_bridge_device_state(parsed)
+}
+
+fn normalize_bridge_device_state(state: BridgeDeviceState) -> Result<BridgeDeviceState> {
+    let mac_device_id = normalize_non_empty_string(&state.mac_device_id)
+        .ok_or_else(|| eyre!("Bridge device state is missing macDeviceId"))?;
+    let mac_identity_public_key = normalize_non_empty_string(&state.mac_identity_public_key)
+        .ok_or_else(|| eyre!("Bridge device state is missing macIdentityPublicKey"))?;
+    let mac_identity_private_key = normalize_non_empty_string(&state.mac_identity_private_key)
+        .ok_or_else(|| eyre!("Bridge device state is missing macIdentityPrivateKey"))?;
+
+    let trusted_phones = state
+        .trusted_phones
+        .into_iter()
+        .filter_map(|(device_id, public_key)| {
+            Some((
+                normalize_non_empty_string(&device_id)?,
+                normalize_non_empty_string(&public_key)?,
+            ))
+        })
+        .collect();
+
+    Ok(BridgeDeviceState {
+        version: 1,
+        mac_device_id,
+        mac_identity_public_key,
+        mac_identity_private_key,
+        trusted_phones,
+    })
+}
+
+fn reconcile_keychain_mirror(
+    canonical_state: &BridgeDeviceState,
+    keychain_record: &StateRecord,
+) -> Result<()> {
+    match keychain_record {
+        StateRecord::Missing => {
+            let _ = write_keychain_state_string(&serde_json::to_string_pretty(canonical_state)?);
+        }
+        StateRecord::Corrupted(_) => {
+            warn_once(
+                &WARNED_KEYCHAIN_UNREADABLE,
+                "[remodex] Ignoring unreadable legacy Keychain pairing mirror; using canonical device-state.json.",
+            );
+            let _ = write_keychain_state_string(&serde_json::to_string_pretty(canonical_state)?);
+        }
+        StateRecord::State(keychain_state) if keychain_state != canonical_state => {
+            warn_once(
+                &WARNED_KEYCHAIN_MISMATCH,
+                "[remodex] Canonical bridge pairing state differs from the legacy Keychain mirror; using device-state.json.",
+            );
+            let _ = write_keychain_state_string(&serde_json::to_string_pretty(canonical_state)?);
+        }
+        StateRecord::State(_) => {}
+    }
+
+    Ok(())
+}
+
+fn warn_once(flag: &AtomicBool, message: &str) {
+    if flag
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        eprintln!("{message}");
+    }
+}
+
+fn normalize_non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn canonical_state_wins_and_repairs_a_corrupt_keychain_mirror() {
+        with_device_state_env(|state_file, keychain_file| {
+            let state = sample_state(
+                "mac-1",
+                "mac-public-1",
+                "mac-private-1",
+                "phone-1",
+                "phone-public-1",
+            );
+            fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+            fs::write(&keychain_file, "{not-json").unwrap();
+
+            let loaded = load_or_create_bridge_device_state().unwrap();
+
+            assert_eq!(loaded, state);
+            let repaired = serde_json::from_str::<BridgeDeviceState>(
+                &fs::read_to_string(keychain_file).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(repaired, state);
+        });
+    }
+
+    #[test]
+    fn missing_canonical_state_recovers_from_keychain_mirror() {
+        with_device_state_env(|state_file, keychain_file| {
+            let state = sample_state(
+                "mac-2",
+                "mac-public-2",
+                "mac-private-2",
+                "phone-2",
+                "phone-public-2",
+            );
+            fs::write(
+                &keychain_file,
+                serde_json::to_string_pretty(&state).unwrap(),
+            )
+            .unwrap();
+
+            let loaded = load_or_create_bridge_device_state().unwrap();
+
+            assert_eq!(loaded, state);
+            let restored =
+                serde_json::from_str::<BridgeDeviceState>(&fs::read_to_string(state_file).unwrap())
+                    .unwrap();
+            assert_eq!(restored, state);
+        });
+    }
+
+    #[test]
+    fn canonical_state_rewrites_a_stale_keychain_mirror() {
+        with_device_state_env(|state_file, keychain_file| {
+            let canonical = sample_state(
+                "mac-3",
+                "mac-public-3",
+                "mac-private-3",
+                "phone-3",
+                "phone-public-3",
+            );
+            let stale = sample_state(
+                "mac-stale",
+                "mac-public-stale",
+                "mac-private-stale",
+                "phone-stale",
+                "phone-public-stale",
+            );
+            fs::write(
+                &state_file,
+                serde_json::to_string_pretty(&canonical).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                &keychain_file,
+                serde_json::to_string_pretty(&stale).unwrap(),
+            )
+            .unwrap();
+
+            let loaded = load_or_create_bridge_device_state().unwrap();
+
+            assert_eq!(loaded, canonical);
+            let repaired = serde_json::from_str::<BridgeDeviceState>(
+                &fs::read_to_string(keychain_file).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(repaired, canonical);
+        });
+    }
+
+    #[test]
+    fn corrupt_canonical_state_does_not_silently_rotate_identity_without_recovery() {
+        with_device_state_env(|state_file, _| {
+            fs::write(&state_file, "{not-json").unwrap();
+
+            let error = load_or_create_bridge_device_state().unwrap_err();
+
+            assert!(error.to_string().contains("canonical bridge pairing state"));
+        });
+    }
+
+    fn with_device_state_env(test: impl FnOnce(PathBuf, PathBuf)) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempdir().unwrap();
+        let state_file = tempdir.path().join("device-state.json");
+        let keychain_file = tempdir.path().join("keychain-state.json");
+        let env_guard = ScopedEnv::new([
+            (
+                "REMODEX_DEVICE_STATE_FILE",
+                Some(state_file.as_os_str().to_os_string()),
+            ),
+            (
+                "REMODEX_DEVICE_STATE_DIR",
+                Some(tempdir.path().as_os_str().to_os_string()),
+            ),
+            (
+                "REMODEX_DEVICE_STATE_KEYCHAIN_MOCK_FILE",
+                Some(keychain_file.as_os_str().to_os_string()),
+            ),
+        ]);
+
+        test(state_file, keychain_file);
+
+        drop(env_guard);
+    }
+
+    fn sample_state(
+        mac_device_id: &str,
+        mac_identity_public_key: &str,
+        mac_identity_private_key: &str,
+        phone_device_id: &str,
+        phone_public_key: &str,
+    ) -> BridgeDeviceState {
+        BridgeDeviceState {
+            version: 1,
+            mac_device_id: mac_device_id.to_owned(),
+            mac_identity_public_key: mac_identity_public_key.to_owned(),
+            mac_identity_private_key: mac_identity_private_key.to_owned(),
+            trusted_phones: BTreeMap::from([(
+                phone_device_id.to_owned(),
+                phone_public_key.to_owned(),
+            )]),
+        }
+    }
+
+    struct ScopedEnv {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl ScopedEnv {
+        fn new<const N: usize>(values: [(&'static str, Option<OsString>); N]) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+
+            for (key, value) in values {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 }

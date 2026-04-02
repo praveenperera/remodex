@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use color_eyre::eyre::{eyre, Result};
@@ -16,6 +16,19 @@ const SERVICE_LABEL: &str = "com.remodex.bridge";
 
 pub struct StartMacOsBridgeServiceResult {
     pub pairing_session: Option<PairingSession>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LaunchAgentStatus {
+    pid: Option<u32>,
+    program: String,
+    arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaunchAgentTarget {
+    program: String,
+    arguments: Vec<String>,
 }
 
 pub async fn run_macos_bridge_service() -> Result<()> {
@@ -82,12 +95,7 @@ pub fn stop_macos_bridge_service() -> Result<()> {
             "The macOS bridge service is only available on macOS."
         ));
     }
-    let _ = Command::new("launchctl")
-        .args([
-            "bootout",
-            &format!("gui/{}/{}", current_uid()?, SERVICE_LABEL),
-        ])
-        .status();
+    let _ = bootout_launch_agent();
     clear_pairing_session();
     clear_bridge_status();
     Ok(())
@@ -103,6 +111,7 @@ pub fn print_macos_bridge_service_status() -> Result<()> {
     let installed = resolve_launch_agent_plist_path().exists();
     let bridge_status = read_bridge_status();
     let pairing_session = read_pairing_session();
+    let launch_agent_status = read_launch_agent_status()?;
     println!("[remodex] Service label: {SERVICE_LABEL}");
     println!(
         "[remodex] Installed: {}",
@@ -110,7 +119,7 @@ pub fn print_macos_bridge_service_status() -> Result<()> {
     );
     println!(
         "[remodex] Launchd loaded: {}",
-        if read_launch_agent_pid()?.is_some() {
+        if launch_agent_status.pid.is_some() {
             "yes"
         } else {
             "no"
@@ -118,7 +127,8 @@ pub fn print_macos_bridge_service_status() -> Result<()> {
     );
     println!(
         "[remodex] PID: {}",
-        read_launch_agent_pid()?
+        launch_agent_status
+            .pid
             .or_else(|| bridge_status.as_ref().map(|status| status.pid))
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "unknown".to_owned())
@@ -136,6 +146,39 @@ pub fn print_macos_bridge_service_status() -> Result<()> {
             .as_ref()
             .map(|status| status.connection_status.as_str())
             .unwrap_or("unknown")
+    );
+    println!(
+        "[remodex] Launchd program: {}",
+        non_empty_or_unknown(&launch_agent_status.program)
+    );
+    println!(
+        "[remodex] Launchd arguments: {}",
+        if launch_agent_status.arguments.is_empty() {
+            "unknown".to_owned()
+        } else {
+            launch_agent_status.arguments.join(" ")
+        }
+    );
+    println!(
+        "[remodex] Bridge runtime: {}",
+        bridge_status
+            .as_ref()
+            .map(|status| non_empty_or_unknown(&status.runtime.runtime_kind))
+            .unwrap_or("unknown".to_owned())
+    );
+    println!(
+        "[remodex] Bridge source: {}",
+        bridge_status
+            .as_ref()
+            .map(|status| non_empty_or_unknown(&status.runtime.runtime_source))
+            .unwrap_or("unknown".to_owned())
+    );
+    println!(
+        "[remodex] Bridge executable: {}",
+        bridge_status
+            .as_ref()
+            .map(|status| non_empty_or_unknown(&status.runtime.runtime_executable))
+            .unwrap_or("unknown".to_owned())
     );
     println!(
         "[remodex] Pairing payload: {}",
@@ -177,23 +220,8 @@ fn write_launch_agent_plist() -> Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let debug_binary = manifest_dir.join("target").join("debug").join("remodex");
-    let program = if debug_binary.exists() {
-        debug_binary.display().to_string()
-    } else {
-        "cargo".to_owned()
-    };
-    let arguments = if program == "cargo" {
-        format!(
-            "<string>cargo</string>\n    <string>run</string>\n    <string>--manifest-path</string>\n    <string>{}</string>\n    <string>--bin</string>\n    <string>remodex</string>\n    <string>--</string>\n    <string>run-service</string>",
-            manifest_dir.join("Cargo.toml").display()
-        )
-    } else {
-        format!(
-            "<string>{}</string>\n    <string>run-service</string>",
-            program
-        )
-    };
+    let target = resolve_launch_agent_target(std::env::current_exe().ok(), &manifest_dir);
+    let arguments = build_launch_agent_arguments_xml(&target);
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -239,12 +267,7 @@ fn write_launch_agent_plist() -> Result<PathBuf> {
 }
 
 fn restart_launch_agent(plist_path: &std::path::Path) -> Result<()> {
-    let _ = Command::new("launchctl")
-        .args([
-            "bootout",
-            &format!("gui/{}/{}", current_uid()?, SERVICE_LABEL),
-        ])
-        .status();
+    let _ = bootout_launch_agent();
     let bootstrap = Command::new("launchctl")
         .args([
             "bootstrap",
@@ -260,6 +283,25 @@ fn restart_launch_agent(plist_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn bootout_launch_agent() -> Result<()> {
+    let uid = current_uid()?;
+    let plist_path = resolve_launch_agent_plist_path();
+    let targets = [
+        vec![
+            "bootout".to_owned(),
+            format!("gui/{uid}"),
+            plist_path.display().to_string(),
+        ],
+        vec!["bootout".to_owned(), format!("gui/{uid}/{SERVICE_LABEL}")],
+    ];
+
+    for target in targets {
+        let _ = Command::new("launchctl").args(&target).status();
+    }
+
+    Ok(())
+}
+
 async fn wait_for_fresh_pairing_session() -> Option<PairingSession> {
     let started_at = std::time::Instant::now();
     while started_at.elapsed() < std::time::Duration::from_secs(10) {
@@ -271,7 +313,7 @@ async fn wait_for_fresh_pairing_session() -> Option<PairingSession> {
     None
 }
 
-fn read_launch_agent_pid() -> Result<Option<u32>> {
+fn read_launch_agent_status() -> Result<LaunchAgentStatus> {
     let output = Command::new("launchctl")
         .args([
             "print",
@@ -279,13 +321,11 @@ fn read_launch_agent_pid() -> Result<Option<u32>> {
         ])
         .output()?;
     if !output.status.success() {
-        return Ok(None);
+        return Ok(LaunchAgentStatus::default());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("pid = "))
-        .and_then(|value| value.trim_end_matches(';').parse().ok()))
+    Ok(parse_launch_agent_status(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn current_uid() -> Result<String> {
@@ -296,4 +336,154 @@ fn current_uid() -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn resolve_launch_agent_target(
+    current_exe: Option<PathBuf>,
+    manifest_dir: &Path,
+) -> LaunchAgentTarget {
+    if let Some(current_exe) = current_exe {
+        return LaunchAgentTarget {
+            program: current_exe.display().to_string(),
+            arguments: vec!["run-service".to_owned()],
+        };
+    }
+
+    let debug_binary = manifest_dir.join("target").join("debug").join("remodex");
+    if debug_binary.exists() {
+        return LaunchAgentTarget {
+            program: debug_binary.display().to_string(),
+            arguments: vec!["run-service".to_owned()],
+        };
+    }
+
+    LaunchAgentTarget {
+        program: "cargo".to_owned(),
+        arguments: vec![
+            "run".to_owned(),
+            "--manifest-path".to_owned(),
+            manifest_dir.join("Cargo.toml").display().to_string(),
+            "--bin".to_owned(),
+            "remodex".to_owned(),
+            "--".to_owned(),
+            "run-service".to_owned(),
+        ],
+    }
+}
+
+fn build_launch_agent_arguments_xml(target: &LaunchAgentTarget) -> String {
+    std::iter::once(&target.program)
+        .chain(target.arguments.iter())
+        .map(|argument| format!("<string>{argument}</string>"))
+        .collect::<Vec<_>>()
+        .join("\n    ")
+}
+
+fn parse_launch_agent_status(stdout: &str) -> LaunchAgentStatus {
+    let mut status = LaunchAgentStatus::default();
+    let mut inside_arguments = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("pid = ") {
+            status.pid = value.trim_end_matches(';').parse().ok();
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("program = ") {
+            status.program = value.to_owned();
+            continue;
+        }
+        if trimmed == "arguments = {" {
+            inside_arguments = true;
+            continue;
+        }
+        if inside_arguments {
+            if trimmed == "}" {
+                inside_arguments = false;
+                continue;
+            }
+            if !trimmed.is_empty() {
+                status.arguments.push(trimmed.to_owned());
+            }
+        }
+    }
+
+    status
+}
+
+fn non_empty_or_unknown(value: &str) -> String {
+    if value.trim().is_empty() {
+        "unknown".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_launch_agent_arguments_xml, parse_launch_agent_status, resolve_launch_agent_target,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn launch_agent_target_prefers_the_current_rust_executable() {
+        let target = resolve_launch_agent_target(
+            Some("/Users/praveen/remodex/phodex-bridge/target/debug/remodex".into()),
+            Path::new("/Users/praveen/remodex/phodex-bridge"),
+        );
+
+        assert_eq!(
+            target.program,
+            "/Users/praveen/remodex/phodex-bridge/target/debug/remodex"
+        );
+        assert_eq!(target.arguments, vec!["run-service".to_owned()]);
+    }
+
+    #[test]
+    fn launch_agent_arguments_xml_includes_program_and_runtime_arguments() {
+        let target = resolve_launch_agent_target(
+            Some("/Users/praveen/remodex/phodex-bridge/target/debug/remodex".into()),
+            Path::new("/Users/praveen/remodex/phodex-bridge"),
+        );
+
+        let xml = build_launch_agent_arguments_xml(&target);
+
+        assert!(xml.contains(
+            "<string>/Users/praveen/remodex/phodex-bridge/target/debug/remodex</string>"
+        ));
+        assert!(xml.contains("<string>run-service</string>"));
+    }
+
+    #[test]
+    fn launch_agent_status_parser_extracts_program_and_arguments() {
+        let parsed = parse_launch_agent_status(
+            r#"
+gui/502/com.remodex.bridge = {
+    pid = 77110;
+    program = /Users/praveen/.local/share/fnm/node-versions/v22.11.0/installation/bin/node
+    arguments = {
+        /Users/praveen/.local/share/fnm/node-versions/v22.11.0/installation/bin/node
+        /Users/praveen/code/remodex/phodex-bridge/bin/remodex.js
+        run-service
+    }
+}
+"#,
+        );
+
+        assert_eq!(parsed.pid, Some(77110));
+        assert_eq!(
+            parsed.program,
+            "/Users/praveen/.local/share/fnm/node-versions/v22.11.0/installation/bin/node"
+        );
+        assert_eq!(
+            parsed.arguments,
+            vec![
+                "/Users/praveen/.local/share/fnm/node-versions/v22.11.0/installation/bin/node"
+                    .to_owned(),
+                "/Users/praveen/code/remodex/phodex-bridge/bin/remodex.js".to_owned(),
+                "run-service".to_owned(),
+            ]
+        );
+    }
 }

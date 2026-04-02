@@ -6,7 +6,7 @@ mod thread_runtime;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result};
 use serde_json::Value;
@@ -87,6 +87,18 @@ struct ContextUsageWatch {
     last_usage_json: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RelayLivenessState {
+    pending_ping_sent_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayWatchdogAction {
+    SendPing,
+    Wait,
+    Reconnect,
+}
+
 enum RelayCommand {
     Text(String),
     Ping,
@@ -118,7 +130,7 @@ struct BridgeRuntime {
     forwarded_request_methods_by_id: HashMap<String, TrackedRequest>,
     relay_sanitized_response_methods_by_id: HashMap<String, TrackedRequest>,
     thread_runtime_registry: ThreadRuntimeRegistry,
-    last_relay_activity_at: Option<Instant>,
+    relay_liveness: RelayLivenessState,
     last_connection_status: Option<String>,
     last_published_status: Option<BridgeStatusSnapshot>,
     codex_handshake_warm: bool,
@@ -187,7 +199,7 @@ pub async fn start_bridge(options: StartBridgeOptions) -> Result<()> {
         forwarded_request_methods_by_id: HashMap::new(),
         relay_sanitized_response_methods_by_id: HashMap::new(),
         thread_runtime_registry: ThreadRuntimeRegistry::default(),
-        last_relay_activity_at: None,
+        relay_liveness: RelayLivenessState::default(),
         last_connection_status: None,
         last_published_status: None,
         codex_handshake_warm: !config.codex_endpoint.trim().is_empty(),
@@ -202,4 +214,112 @@ pub async fn start_bridge(options: StartBridgeOptions) -> Result<()> {
     };
 
     runtime.run().await
+}
+
+impl RelayLivenessState {
+    fn mark_connected(&mut self) {
+        self.mark_activity_at(Instant::now());
+    }
+
+    fn mark_activity(&mut self) {
+        self.mark_activity_at(Instant::now());
+    }
+
+    fn mark_activity_at(&mut self, _at: Instant) {
+        self.pending_ping_sent_at = None;
+    }
+
+    fn next_watchdog_action(&mut self, stale_after: Duration) -> RelayWatchdogAction {
+        self.next_watchdog_action_at(Instant::now(), stale_after)
+    }
+
+    fn next_watchdog_action_at(
+        &mut self,
+        now: Instant,
+        stale_after: Duration,
+    ) -> RelayWatchdogAction {
+        match self.pending_ping_sent_at {
+            Some(sent_at) if now.duration_since(sent_at) >= stale_after => {
+                RelayWatchdogAction::Reconnect
+            }
+            Some(_) => RelayWatchdogAction::Wait,
+            None => {
+                self.pending_ping_sent_at = Some(now);
+                RelayWatchdogAction::SendPing
+            }
+        }
+    }
+
+    fn is_stale(&self, stale_after: Duration) -> bool {
+        self.is_stale_at(Instant::now(), stale_after)
+    }
+
+    fn is_stale_at(&self, now: Instant, stale_after: Duration) -> bool {
+        self.pending_ping_sent_at
+            .map(|sent_at| now.duration_since(sent_at) >= stale_after)
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RelayLivenessState, RelayWatchdogAction};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn watchdog_waits_for_the_probe_deadline_before_reconnecting() {
+        let start = Instant::now();
+        let mut liveness = RelayLivenessState::default();
+        liveness.mark_activity_at(start);
+
+        assert_eq!(
+            liveness
+                .next_watchdog_action_at(start + Duration::from_secs(10), Duration::from_secs(25)),
+            RelayWatchdogAction::SendPing
+        );
+        assert_eq!(
+            liveness
+                .next_watchdog_action_at(start + Duration::from_secs(20), Duration::from_secs(25)),
+            RelayWatchdogAction::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_reconnects_after_a_missed_probe_deadline() {
+        let start = Instant::now();
+        let mut liveness = RelayLivenessState::default();
+        liveness.mark_activity_at(start);
+        assert_eq!(
+            liveness
+                .next_watchdog_action_at(start + Duration::from_secs(10), Duration::from_secs(25)),
+            RelayWatchdogAction::SendPing
+        );
+
+        assert_eq!(
+            liveness
+                .next_watchdog_action_at(start + Duration::from_secs(36), Duration::from_secs(25)),
+            RelayWatchdogAction::Reconnect
+        );
+        assert!(liveness.is_stale_at(start + Duration::from_secs(36), Duration::from_secs(25)));
+    }
+
+    #[test]
+    fn inbound_activity_clears_a_pending_probe() {
+        let start = Instant::now();
+        let mut liveness = RelayLivenessState::default();
+        liveness.mark_activity_at(start);
+        assert_eq!(
+            liveness
+                .next_watchdog_action_at(start + Duration::from_secs(10), Duration::from_secs(25)),
+            RelayWatchdogAction::SendPing
+        );
+
+        liveness.mark_activity_at(start + Duration::from_secs(18));
+
+        assert_eq!(
+            liveness
+                .next_watchdog_action_at(start + Duration::from_secs(28), Duration::from_secs(25)),
+            RelayWatchdogAction::SendPing
+        );
+    }
 }

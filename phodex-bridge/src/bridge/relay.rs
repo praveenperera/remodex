@@ -1,7 +1,10 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use color_eyre::eyre::{eyre, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -9,12 +12,16 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::codex_transport::CodexEvent;
-use crate::daemon_state::{clear_bridge_status, write_bridge_status};
+use crate::daemon_state::{
+    clear_bridge_status, current_bridge_runtime_metadata, write_bridge_status,
+};
 
 use super::support::{
     build_mac_registration_headers, relay_ws_url, send_relay_registration_update, shutdown_signal,
 };
-use super::{BridgeRuntime, BridgeStatusSnapshot, RelayCommand, RelayConnection};
+use super::{
+    BridgeRuntime, BridgeStatusSnapshot, RelayCommand, RelayConnection, RelayWatchdogAction,
+};
 
 impl BridgeRuntime {
     pub(super) async fn run(&mut self) -> Result<()> {
@@ -118,7 +125,7 @@ impl BridgeRuntime {
         mut relay: RelayConnection,
         shutdown_rx: &mut UnboundedReceiver<()>,
     ) -> Result<bool> {
-        self.last_relay_activity_at = Some(Instant::now());
+        self.relay_liveness.mark_connected();
         self.secure_transport
             .bind_live_send_wire_message(relay.wire_text_tx.clone());
         send_relay_registration_update(
@@ -126,6 +133,7 @@ impl BridgeRuntime {
             self.secure_transport.current_device_state(),
         );
         self.log_connection_status("connected")?;
+        self.log_runtime_context();
 
         let mut ping_interval = tokio::time::interval(Duration::from_millis(
             super::RELAY_WATCHDOG_PING_INTERVAL_MS,
@@ -184,15 +192,23 @@ impl BridgeRuntime {
                     }
                 },
                 _ = ping_interval.tick() => {
-                    let stale = self.last_relay_activity_at
-                        .map(|at| at.elapsed() >= Duration::from_millis(super::RELAY_WATCHDOG_STALE_AFTER_MS))
-                        .unwrap_or(false);
-                    if stale {
-                        self.handle_transport_reset();
-                        self.publish_status("running", "disconnected", super::STALE_RELAY_STATUS_MESSAGE)?;
-                        return Ok(true);
+                    match self.relay_liveness.next_watchdog_action(Duration::from_millis(
+                        super::RELAY_WATCHDOG_STALE_AFTER_MS,
+                    )) {
+                        RelayWatchdogAction::Reconnect => {
+                            self.handle_transport_reset();
+                            self.publish_status("running", "disconnected", super::STALE_RELAY_STATUS_MESSAGE)?;
+                            return Ok(true);
+                        }
+                        RelayWatchdogAction::SendPing => {
+                            if relay.command_tx.send(RelayCommand::Ping).is_err() {
+                                self.handle_transport_reset();
+                                self.log_connection_status("disconnected")?;
+                                return Ok(true);
+                            }
+                        }
+                        RelayWatchdogAction::Wait => {}
                     }
-                    let _ = relay.command_tx.send(RelayCommand::Ping);
                 }
                 _ = heartbeat_interval.tick() => {
                     self.write_heartbeat_status()?;
@@ -228,15 +244,16 @@ impl BridgeRuntime {
                 command_tx,
                 self.secure_transport.current_device_state(),
             );
+            self.log_runtime_context();
         }
     }
 
     fn mark_relay_activity(&mut self) {
-        self.last_relay_activity_at = Some(Instant::now());
+        self.relay_liveness.mark_activity();
     }
 
     fn handle_transport_reset(&mut self) {
-        self.last_relay_activity_at = None;
+        self.relay_liveness = Default::default();
         self.context_usage_watch = None;
         if let Some(rollout_live_mirror) = self.rollout_live_mirror.as_mut() {
             rollout_live_mirror.stop_all();
@@ -282,11 +299,10 @@ impl BridgeRuntime {
             );
         }
 
-        let stale = self
-            .last_relay_activity_at
-            .map(|at| at.elapsed() >= Duration::from_millis(super::RELAY_WATCHDOG_STALE_AFTER_MS))
-            .unwrap_or(false);
-        if stale {
+        if self
+            .relay_liveness
+            .is_stale(Duration::from_millis(super::RELAY_WATCHDOG_STALE_AFTER_MS))
+        {
             return write_bridge_status(
                 &status.state,
                 "disconnected",
@@ -302,4 +318,38 @@ impl BridgeRuntime {
             &status.last_error,
         )
     }
+
+    fn log_runtime_context(&self) {
+        let runtime = current_bridge_runtime_metadata();
+        let device_state = self.secure_transport.current_device_state();
+        let trusted_phone_key = device_state
+            .trusted_phones
+            .values()
+            .next()
+            .map(String::as_str)
+            .unwrap_or("");
+        println!(
+            "[remodex] runtime={} source={} executable={} macKey={} trustedPhoneKey={}",
+            runtime.runtime_kind,
+            runtime.runtime_source,
+            runtime.runtime_executable,
+            short_public_key_fingerprint(&device_state.mac_identity_public_key),
+            short_public_key_fingerprint(trusted_phone_key),
+        );
+    }
+}
+
+fn short_public_key_fingerprint(public_key_base64: &str) -> String {
+    if public_key_base64.trim().is_empty() {
+        return "none".to_owned();
+    }
+
+    let bytes = BASE64
+        .decode(public_key_base64.trim())
+        .unwrap_or_else(|_| public_key_base64.trim().as_bytes().to_vec());
+    let digest = Sha256::digest(bytes);
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
